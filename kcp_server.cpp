@@ -22,6 +22,7 @@ typedef struct kcp_context {
         struct sockaddr_in in;
         struct sockaddr addr;
     } addr;
+    uv_timer_t update_timer;
 } kcp_context;
 
 /* encode 8 bits unsigned int */
@@ -129,6 +130,18 @@ int kcp_output(const char *buf, int len, ikcpcb *kcp, void *user) {
     send_kcp_packet(kcp_ctx->handle, &kcp_ctx->addr.addr, buf, len);
 }
 
+void timer_cb(uv_timer_t* handle) {
+    kcp_context * kcp_ctx = (kcp_context *)handle->data;
+    IUINT32 current_time = (IUINT32)uv_now(uv_default_loop());
+    ikcp_update(kcp_ctx->kcp, current_time);
+    IUINT32 next_time = ikcp_check(kcp_ctx->kcp, current_time);
+    int err = uv_timer_start(&kcp_ctx->update_timer, timer_cb, next_time - current_time, kcp_ctx->kcp->interval);
+    if (0 != err) {
+        printf("uv_timer_start error: %s\n", uv_strerror(err));
+        return;
+    }
+}
+
 void alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
     static char buffer[64 * 1024];
     *buf = uv_buf_init(buffer, sizeof(buffer));
@@ -164,6 +177,22 @@ void udp_recv_cb(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const str
             kcp_ctx->kcp->stream = 1;
             kcp_map.emplace(std::make_pair(conv, kcp_ctx->kcp));
             send_udp_packet(handle, addr, 2, conv ^ conv_or_key); // ACK
+
+            // 添加update定时器
+            IUINT32 current_time = (IUINT32)uv_now(uv_default_loop());
+            IUINT32 next_time = ikcp_check(kcp_ctx->kcp, current_time);
+            int err = uv_timer_init(uv_default_loop(), &kcp_ctx->update_timer);
+            if (0 != err) {
+                printf("uv_timer_init error: %s\n", uv_strerror(err));
+                return;
+            }
+
+            kcp_ctx->update_timer.data = kcp_ctx;
+            err = uv_timer_start(&kcp_ctx->update_timer, timer_cb, next_time - current_time, kcp_ctx->kcp->interval);
+            if (0 != err) {
+                printf("uv_timer_start error: %s\n", uv_strerror(err));
+                return;
+            }
 
         } else if (cmd == 2) { // ACK
 
