@@ -14,6 +14,16 @@ typedef struct udp_req {
     char buf[1];
 } udp_req;
 
+typedef struct kcp_context {
+    ikcpcb * kcp;
+    uv_udp_t * handle;
+    union {
+        struct sockaddr_in6 in6;
+        struct sockaddr_in in;
+        struct sockaddr addr;
+    } addr;
+} kcp_context;
+
 /* encode 8 bits unsigned int */
 static inline char *encode8u(char *p, unsigned char c)
 {
@@ -86,7 +96,7 @@ void udp_send_cb(uv_udp_send_t* req, int status) {
     free(r);
 }
 
-void send_udp_packet(uv_udp_t * handle, char cmd, IUINT32 conv) {
+void send_udp_packet(uv_udp_t * handle, const sockaddr *addr, char cmd, IUINT32 conv) {
     udp_req * req = (udp_req *)malloc(sizeof(udp_req) + 5);
     req->req.data = req;
 
@@ -95,10 +105,28 @@ void send_udp_packet(uv_udp_t * handle, char cmd, IUINT32 conv) {
     ptr = encode8u(ptr, cmd);
     uv_buf_t buf = uv_buf_init(req->buf, 5);
 
-    int err = uv_udp_send(&req->req, handle, &buf, 1, NULL, udp_send_cb);
+    int err = uv_udp_send(&req->req, handle, &buf, 1, addr, udp_send_cb);
     if (0 != err) {
         printf("uv_udp_send error: %s\n", uv_strerror(err));
     }
+}
+
+void send_kcp_packet(uv_udp_t * handle, const sockaddr *addr, const char *buffer, int len) {
+    udp_req * req = (udp_req *)malloc(sizeof(udp_req) + len);
+    req->req.data = req;
+
+    memcpy(req->buf, buffer, len);
+    uv_buf_t buf = uv_buf_init(req->buf, len);
+
+    int err = uv_udp_send(&req->req, handle, &buf, 1, addr, udp_send_cb);
+    if (0 != err) {
+        printf("uv_udp_send error: %s\n", uv_strerror(err));
+    }
+}
+
+int kcp_output(const char *buf, int len, ikcpcb *kcp, void *user) {
+    kcp_context * kcp_ctx = (kcp_context *)user;
+    send_kcp_packet(kcp_ctx->handle, &kcp_ctx->addr.addr, buf, len);
 }
 
 void alloc_cb(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
@@ -122,9 +150,20 @@ void udp_recv_cb(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const str
         char cmd = buf->base[4];
         if (cmd == 1) { // SYN
             IUINT32 conv = ++s_conv;
-            ikcpcb * kcp = ikcp_create(conv, handle);
-            kcp_map.emplace(std::make_pair(conv, kcp));
-            send_udp_packet(handle, 2, conv ^ conv_or_key); // ACK
+            kcp_context * kcp_ctx = (kcp_context *)malloc(sizeof(kcp_context));
+            kcp_ctx->handle = handle;
+            if (addr->sa_family == AF_INET) {
+                memcpy(&kcp_ctx->addr.in, addr, sizeof(kcp_ctx->addr.in));
+            } else {
+                memcpy(&kcp_ctx->addr.in6, addr, sizeof(kcp_ctx->addr.in6));
+            }
+            kcp_ctx->kcp = ikcp_create(conv, kcp_ctx);
+            ikcp_nodelay(kcp_ctx->kcp, 1, 10, 2, 1);
+            ikcp_wndsize(kcp_ctx->kcp, 1024, 1024);
+            ikcp_setoutput(kcp_ctx->kcp, kcp_output);
+            kcp_ctx->kcp->stream = 1;
+            kcp_map.emplace(std::make_pair(conv, kcp_ctx->kcp));
+            send_udp_packet(handle, addr, 2, conv ^ conv_or_key); // ACK
 
         } else if (cmd == 2) { // ACK
 
@@ -135,6 +174,7 @@ void udp_recv_cb(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const str
                 return;
             }
 
+            free(it->second->user);
             ikcp_release(it->second);
             kcp_map.erase(it);
 
@@ -152,9 +192,10 @@ void udp_recv_cb(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const str
         nread = ikcp_input(it->second, buf->base, nread);
         if (nread < 0) {
             printf("ikcp_input error: %d\n", nread);
+            free(it->second->user);
             ikcp_release(it->second);
             kcp_map.erase(it);
-            send_udp_packet(handle, 3, it->second->conv);
+            send_udp_packet(handle, addr, 3, it->second->conv);
             return;
         }
 
@@ -234,6 +275,7 @@ int main(int argc, const char ** argv) {
     uv_loop_close(uv_default_loop());
 
     for (auto & it: kcp_map) {
+        free(it.second->user);
         ikcp_release(it.second);
     }
     kcp_map.clear();
