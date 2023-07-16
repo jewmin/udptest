@@ -2,6 +2,7 @@
 #include "ikcp.h"
 #include <string.h>
 #include <unordered_map>
+#include <algorithm>
 
 uint32_t s_conv = 1000;
 std::unordered_map<IUINT32, ikcpcb *> kcp_map;
@@ -62,6 +63,13 @@ static inline const char *decode32u(const char *p, IUINT32 *l)
 #endif
 	p += 4;
 	return p;
+}
+
+double calc_time(struct timespec * begin, struct timespec * end) {
+    long seconds = end->tv_sec - begin->tv_sec;
+    long nanoseconds = end->tv_nsec - begin->tv_nsec;
+    double elapsed = seconds + nanoseconds * 1e-9;
+    return elapsed;
 }
 
 int create_timer(uv_timer_t * handle, uv_timer_cb cb, uint64_t timeout, uint64_t repeat) {
@@ -141,7 +149,7 @@ int send_udp_packet(uv_udp_t * handle, const sockaddr *addr, char cmd, IUINT32 c
 int send_kcp_packet(uv_udp_t * handle, const sockaddr *addr, const char *buffer, int len) {
     uint32_t conv;
     decode32u(buffer, &conv);
-    printf("send_kcp_packet %u %d\n", conv, len);
+    // printf("send_kcp_packet %u %d\n", conv, len);
     udp_req * req = (udp_req *)malloc(sizeof(udp_req) + len);
     req->req.data = req;
 
@@ -173,7 +181,8 @@ void walk_cb(uv_handle_t* handle, void* arg) {
 
 class KcpContext {
 public:
-    KcpContext(uv_udp_t * handle, const struct sockaddr * src_addr, uint32_t conv, output_cb cb) : udp_handle(handle), update_timer(nullptr), send_timer(nullptr), kcp(nullptr) {
+    KcpContext(uv_udp_t * handle, const struct sockaddr * src_addr, uint32_t conv, output_cb cb)
+        : udp_handle(handle), update_timer(nullptr), send_timer(nullptr), kcp(nullptr), last_recv_time(0) {
         if (src_addr->sa_family == AF_INET) {
             memcpy(&addr.in, src_addr, sizeof(addr.in));
         } else {
@@ -191,8 +200,8 @@ public:
         ikcp_setoutput(kcp, cb);
         kcp->stream = 1;
 
-        uint32_t current_time = (uint32_t)uv_now(uv_default_loop());
-        uint32_t next_time = ikcp_check(kcp, current_time);
+        // uint32_t current_time = (uint32_t)uv_now(uv_default_loop());
+        // uint32_t next_time = ikcp_check(kcp, current_time);
         update_timer = (uv_timer_t *)malloc(sizeof(uv_timer_t));
         if (!update_timer) {
             printf("malloc update_timer error\n");
@@ -200,7 +209,8 @@ public:
         }
 
         update_timer->data = this;
-        create_timer(update_timer, UpdateTimerCb, next_time - current_time, kcp->interval);
+        // create_timer(update_timer, UpdateTimerCb, std::min(next_time - current_time, (uint32_t)1), kcp->interval);
+        create_timer(update_timer, UpdateTimerCb, kcp->interval, kcp->interval);
     }
 
     ~KcpContext() {
@@ -215,6 +225,14 @@ public:
 
     bool IsCreated() const {
         return kcp != nullptr && update_timer != nullptr;
+    }
+
+    bool IsTimeout() const {
+        if (last_recv_time == 0) {
+            return false;
+        }
+
+        return (uint32_t)uv_now(uv_default_loop()) - last_recv_time > 60000;
     }
 
     void CloseUpdateTimer() {
@@ -252,16 +270,27 @@ protected:
         uint32_t current_time = (uint32_t)uv_now(uv_default_loop());
         ikcp_update(kcp_ctx->kcp, current_time);
 
-        uint32_t next_time = ikcp_check(kcp_ctx->kcp, current_time);
-        int err = uv_timer_start(kcp_ctx->update_timer, UpdateTimerCb, next_time - current_time, kcp_ctx->kcp->interval);
-        if (0 != err) {
-            printf("uv_timer_start error: %s\n", uv_strerror(err));
+        // uint32_t next_time = ikcp_check(kcp_ctx->kcp, current_time);
+        // int err = uv_timer_start(kcp_ctx->update_timer, UpdateTimerCb, std::min(next_time - current_time, (uint32_t)1), kcp_ctx->kcp->interval);
+        // if (0 != err) {
+        //     printf("uv_timer_start error: %s\n", uv_strerror(err));
+        // }
+
+        if (kcp_ctx->IsTimeout()) {
+            send_udp_packet(kcp_ctx->udp_handle, &kcp_ctx->addr.addr, 3, kcp_ctx->kcp->conv);
+            auto it = kcp_map.find(kcp_ctx->kcp->conv);
+            if (it == kcp_map.end()) {
+                printf("UpdateTimerCb not exist conv: %u\n", kcp_ctx->kcp->conv);
+                return;
+            }
+            delete kcp_ctx;
+            kcp_map.erase(it);
         }
     }
 
     static void SendTimerCb(uv_timer_t * handle) {
         KcpContext * kcp_ctx = (KcpContext *)handle->data;
-        int num = 0;//rand() % 10;
+        int num = rand() % 10;
         for (int i = 0; i <= num; i++) {
             ikcp_send(kcp_ctx->kcp, "12345678", 8);
         }
@@ -277,4 +306,5 @@ public:
         struct sockaddr_in in;
         struct sockaddr addr;
     } addr;
+    uint32_t last_recv_time;
 };

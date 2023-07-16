@@ -7,6 +7,7 @@ uv_timer_t watch_timer;
 
 void watch_cb(uv_timer_t* handle) {
     printf("%lu\n", uv_now(uv_default_loop()));
+    printf("recv: %ld, recv_bytes: %ld, send: %ld, send_bytes: %ld\n", recv_count, recv_bytes, send_count, send_bytes);
 }
 
 int kcp_output(const char *buf, int len, ikcpcb *kcp, void *user) {
@@ -24,7 +25,7 @@ void udp_recv_cb(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const str
     recv_bytes += nread;
     
     if (nread < 5) {
-        printf("udp_recv_cb nread: %ld\n", nread);
+        // printf("udp_recv_cb nread: %ld\n", nread);
         return;
     }
 
@@ -68,7 +69,7 @@ void udp_recv_cb(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const str
         }
 
     } else { // kcp
-        printf("kcp recv: %u, %ld\n", conv_or_key, nread);
+        // printf("kcp recv: %u, %ld\n", conv_or_key, nread);
         auto it = kcp_map.find(conv_or_key);
         if (it == kcp_map.end()) {
             printf("udp_recv_cb not exist conv: %u\n", conv_or_key);
@@ -84,6 +85,9 @@ void udp_recv_cb(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const str
             send_udp_packet(handle, addr, 3, it->second->conv);
             return;
         }
+
+        KcpContext * kcp_ctx = (KcpContext *)it->second->user;
+        kcp_ctx->last_recv_time = (uint32_t)uv_now(uv_default_loop());
 
         while (true) { // echo 回显
             nread = ikcp_recv(it->second, buf->base, buf->len);
@@ -148,9 +152,15 @@ int main(int argc, const char ** argv) {
     }
 
     create_timer(&watch_timer, watch_cb, 10000, 10000);
+    struct timespec begin;
+    struct timespec end;
+    clock_gettime(CLOCK_REALTIME, &begin);
     uv_run(uv_default_loop(), UV_RUN_DEFAULT);
-
+    clock_gettime(CLOCK_REALTIME, &end);
+    printf("clear resource %ld.%ld\n", end.tv_sec, end.tv_nsec);
+    double use_time = calc_time(&begin, &end);
     printf("clear resource recv: %ld, recv_bytes: %ld, send: %ld, send_bytes: %ld\n", recv_count, recv_bytes, send_count, send_bytes);
+    printf("clear resource per second recv: %lf, recv_bytes: %lf, send: %lf, send_bytes: %lf\n", (double)recv_count / use_time, (double)recv_bytes / use_time, (double)send_count / use_time, (double)send_bytes / use_time);
 
     for (auto & it: kcp_map) {
         KcpContext * kcp_ctx = (KcpContext *)it.second->user;
