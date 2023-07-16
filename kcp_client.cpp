@@ -5,6 +5,13 @@
 
 static uv_timer_t connect_timer;
 
+uv_timer_t watch_timer;
+
+void watch_cb(uv_timer_t* handle) {
+    printf("%lu\n", uv_now(uv_default_loop()));
+    printf("recv: %ld, recv_bytes: %ld, send: %ld, send_bytes: %ld\n", recv_count, recv_bytes, send_count, send_bytes);
+}
+
 int connect(uv_udp_t * handle);
 
 int kcp_output(const char *buf, int len, ikcpcb *kcp, void *user) {
@@ -194,6 +201,7 @@ int main(int argc, const char ** argv) {
         return 0;
     }
 
+    create_timer(&watch_timer, watch_cb, 10000, 10000);
     struct timespec begin;
     struct timespec end;
     clock_gettime(CLOCK_REALTIME, &begin);

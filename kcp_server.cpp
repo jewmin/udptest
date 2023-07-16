@@ -73,6 +73,7 @@ void udp_recv_cb(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const str
         auto it = kcp_map.find(conv_or_key);
         if (it == kcp_map.end()) {
             printf("udp_recv_cb not exist conv: %u\n", conv_or_key);
+            send_udp_packet(handle, addr, 3, conv_or_key);
             return;
         }
 
