@@ -3,22 +3,39 @@
 #include <stdint.h>
 #include "kcp_util.h"
 
-uv_timer_t watch_timer;
+static uv_timer_t connect_timer;
 
-void watch_cb(uv_timer_t* handle) {
-    printf("%lu\n", uv_now(uv_default_loop()));
-}
+int connect(uv_udp_t * handle);
 
 int kcp_output(const char *buf, int len, ikcpcb *kcp, void *user) {
     KcpContext * kcp_ctx = (KcpContext *)user;
-    return send_kcp_packet(kcp_ctx->udp_handle, &kcp_ctx->addr.addr, buf, len);
+    return send_kcp_packet(kcp_ctx->udp_handle, NULL, buf, len);
+}
+
+void connect_timeout_cb(uv_timer_t* handle) {
+    uv_udp_t * udp_client = (uv_udp_t *)handle->data;
+    connect(udp_client);
+}
+
+int connect(uv_udp_t * handle) {
+    int r = rand();
+    handle->data = (void*)(long)r;
+    send_udp_packet(handle, NULL, 1, (IUINT32)r);
+
+    int err = uv_timer_start(&connect_timer, connect_timeout_cb, 30000, 0);
+    if (0 != err) {
+        printf("uv_timer_start error: %s\n", uv_strerror(err));
+        return err;
+    }
+
+    return 0;
 }
 
 void udp_recv_cb(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const struct sockaddr* addr, unsigned flags) {
     if (nread < 0) {
         printf("udp_recv_cb error: %s\n", uv_strerror(nread));
         return;
-    }
+    } 
 
     recv_count += 1;
     recv_bytes += nread;
@@ -34,23 +51,28 @@ void udp_recv_cb(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const str
     if (nread < 24) { // udp
         char cmd = buf->base[4];
         if (cmd == 1) { // SYN
-            IUINT32 conv = ++s_conv;
+
+        } else if (cmd == 2) { // ACK
+            IUINT32 conv = conv_or_key ^ (int)(long)handle->data;
+            printf("ack %u %u\n", conv, conv_or_key);
             KcpContext * kcp_ctx = new KcpContext(handle, addr, conv, kcp_output);
             if (!kcp_ctx) {
                 printf("new KcpContext error\n");
+                // 握手失败，重连
+                connect(handle);
                 return;
             }
 
             if (!kcp_ctx->IsCreated()) {
                 delete kcp_ctx;
+                // 握手失败，重连
+                connect(handle);
                 return;
             }
 
             kcp_map.emplace(std::make_pair(conv, kcp_ctx->kcp));
-            printf("syn %u %u\n", conv, conv_or_key);
-            send_udp_packet(handle, addr, 2, conv ^ conv_or_key); // ACK
-
-        } else if (cmd == 2) { // ACK
+            // 发协议
+            kcp_ctx->StartSend();
 
         } else if (cmd == 3) { // FIN
             auto it = kcp_map.find(conv_or_key);
@@ -62,6 +84,9 @@ void udp_recv_cb(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const str
             KcpContext * kcp_ctx = (KcpContext *)it->second->user;
             delete kcp_ctx;
             kcp_map.erase(it);
+
+            // 断线重连
+            connect(handle);
 
         } else {
             printf("udp_recv_cb unknown udp packet: %ld\n", nread);
@@ -78,8 +103,8 @@ void udp_recv_cb(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const str
         nread = ikcp_input(it->second, buf->base, nread);
         if (nread < 0) {
             printf("ikcp_input error: %ld\n", nread);
-            KcpContext * kcp_ctx = (KcpContext *)it->second->user;
-            delete kcp_ctx;
+            free(it->second->user);
+            ikcp_release(it->second);
             kcp_map.erase(it);
             send_udp_packet(handle, addr, 3, it->second->conv);
             return;
@@ -104,32 +129,33 @@ void udp_recv_cb(uv_udp_t* handle, ssize_t nread, const uv_buf_t* buf, const str
 }
 
 int main(int argc, const char ** argv) {
-    printf("kcp server pid: %d\n", uv_os_getpid());
-    if (argc < 2) {
-        printf("usage: kcp_server port\n");
+    printf("kcp client pid: %d\n", uv_os_getpid());
+    if (argc < 3) {
+        printf("usage: kcp_client ip port\n");
         return 0;
     }
 
-    int port = atoi(argv[1]);
+    const char * ip = argv[1];
+    int port = atoi(argv[2]);
 
     int err;
     struct sockaddr_in addr;
-    err = uv_ip4_addr("0.0.0.0", port, &addr);
+    err = uv_ip4_addr(ip, port, &addr);
     if (0 != err) {
         printf("uv_ip4_addr error: %s\n", uv_strerror(err));
         return 0;
     }
 
-    uv_udp_t udp_server;
-    err = uv_udp_init(uv_default_loop(), &udp_server);
+    uv_udp_t udp_client;
+    err = uv_udp_init(uv_default_loop(), &udp_client);
     if (0 != err) {
         printf("uv_udp_init error: %s\n", uv_strerror(err));
         return 0;
     }
 
-    err = uv_udp_bind(&udp_server, (const sockaddr *)&addr, 0);
+    err = uv_udp_connect(&udp_client, (const sockaddr *)&addr);
     if (0 != err) {
-        printf("uv_udp_bind error: %s\n", uv_strerror(err));
+        printf("uv_udp_connect error: %s\n", uv_strerror(err));
         return 0;
     }
 
@@ -141,13 +167,24 @@ int main(int argc, const char ** argv) {
         return 0;
     }
 
-    err = uv_udp_recv_start(&udp_server, alloc_cb, udp_recv_cb);
+    err = uv_udp_recv_start(&udp_client, alloc_cb, udp_recv_cb);
     if (0 != err) {
         printf("uv_udp_recv_start error: %s\n", uv_strerror(err));
         return 0;
     }
 
-    create_timer(&watch_timer, watch_cb, 10000, 10000);
+
+    connect_timer.data = &udp_client;
+    err = uv_timer_init(uv_default_loop(), &connect_timer);
+    if (0 != err) {
+        printf("uv_timer_init error: %s\n", uv_strerror(err));
+        return 0;
+    }
+
+    if (0 != connect(&udp_client)) {
+        return 0;
+    }
+
     uv_run(uv_default_loop(), UV_RUN_DEFAULT);
 
     printf("clear resource recv: %ld, recv_bytes: %ld, send: %ld, send_bytes: %ld\n", recv_count, recv_bytes, send_count, send_bytes);
